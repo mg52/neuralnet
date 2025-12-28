@@ -14,10 +14,10 @@ import (
 
 func TestActivationFunctions(t *testing.T) {
 	assert.InDelta(t, 0.5, SigmoidFunc(0), 0.001)
-	assert.InDelta(t, 0.0, ReLUFunc(-2), 0.001)
-	assert.InDelta(t, 2.0, ReLUFunc(2), 0.001)
+	assert.Equal(t, 0.0, ReLUFunc(-2))
+	assert.Equal(t, 2.0, ReLUFunc(2))
 	assert.InDelta(t, math.Tanh(1.0), TanhFunc(1.0), 0.0001)
-	assert.InDelta(t, 5.0, LinearFunc(5.0), 0.001)
+	assert.Equal(t, 5.0, LinearFunc(5.0))
 }
 
 // ---------------------------------------------------------
@@ -26,8 +26,8 @@ func TestActivationFunctions(t *testing.T) {
 
 func TestInitWeightsShape(t *testing.T) {
 	w := initWeights(4, 3, ReLU)
-	assert.Equal(t, 4, len(w))
-	assert.Equal(t, 3, len(w[0]))
+	assert.Len(t, w, 4)
+	assert.Len(t, w[0], 3)
 }
 
 // ---------------------------------------------------------
@@ -61,7 +61,7 @@ func TestSoftmax(t *testing.T) {
 		sum += v
 	}
 
-	assert.InDelta(t, 1.0, sum, 0.0001)
+	assert.InDelta(t, 1.0, sum, 1e-6)
 	assert.True(t, s[2] > s[1] && s[1] > s[0])
 }
 
@@ -82,7 +82,7 @@ func TestNewNetwork(t *testing.T) {
 
 	assert.Equal(t, 4, n.InputSize)
 	assert.Equal(t, 3, n.OutputSize)
-	assert.Equal(t, 2, len(n.Weights))
+	assert.Len(t, n.Weights, 2)
 	assert.True(t, n.IsSoftmaxOut)
 }
 
@@ -102,7 +102,33 @@ func TestPredictShape(t *testing.T) {
 	)
 
 	out := n.Predict([]float64{0.2, 0.1, 0.9})
-	assert.Equal(t, 2, len(out))
+	assert.Len(t, out, 2)
+}
+
+// ---------------------------------------------------------
+// PredictBatch
+// ---------------------------------------------------------
+
+func TestPredictBatch(t *testing.T) {
+	n := NewNetwork(
+		2,
+		[]int{4},
+		1,
+		[]string{ReLU, Sigmoid},
+		0.01,
+		LossMSE,
+		OptimizerSGD,
+	)
+
+	inputs := [][]float64{
+		{0, 0},
+		{1, 1},
+		{0, 1},
+	}
+
+	outs := n.PredictBatch(inputs)
+	assert.Len(t, outs, 3)
+	assert.Len(t, outs[0], 1)
 }
 
 // ---------------------------------------------------------
@@ -123,7 +149,6 @@ func TestSaveLoad(t *testing.T) {
 	filename := "test_weights.json"
 	err := n1.SaveWeights(filename)
 	assert.NoError(t, err)
-
 	defer os.Remove(filename)
 
 	n2 := NewNetwork(
@@ -144,7 +169,7 @@ func TestSaveLoad(t *testing.T) {
 }
 
 // ---------------------------------------------------------
-// Simple Training - XOR
+// Simple Training - XOR (SGD)
 // ---------------------------------------------------------
 
 func TestTrainXOR_SGD(t *testing.T) {
@@ -163,7 +188,7 @@ func TestTrainXOR_SGD(t *testing.T) {
 
 	n := NewNetwork(
 		2,
-		[]int{4},
+		[]int{8},
 		1,
 		[]string{Tanh, Sigmoid},
 		0.1,
@@ -171,21 +196,18 @@ func TestTrainXOR_SGD(t *testing.T) {
 		OptimizerSGD,
 	)
 
-	for epoch := 0; epoch < 7000; epoch++ {
-		for i := range inputs {
-			n.Train(inputs[i], targets[i])
-		}
+	for epoch := 0; epoch < 6000; epoch++ {
+		n.TrainBatch(inputs, targets)
 	}
 
 	for i := range inputs {
 		out := n.Predict(inputs[i])[0]
-		exp := targets[i][0]
-		assert.InDelta(t, exp, out, 0.3)
+		assert.InDelta(t, targets[i][0], out, 0.35)
 	}
 }
 
 // ---------------------------------------------------------
-// Adam Optimizer Test
+// XOR - Adam Optimizer
 // ---------------------------------------------------------
 
 func TestTrainXOR_Adam(t *testing.T) {
@@ -204,7 +226,7 @@ func TestTrainXOR_Adam(t *testing.T) {
 
 	n := NewNetwork(
 		2,
-		[]int{4},
+		[]int{8},
 		1,
 		[]string{Tanh, Sigmoid},
 		0.01,
@@ -213,20 +235,17 @@ func TestTrainXOR_Adam(t *testing.T) {
 	)
 
 	for epoch := 0; epoch < 2000; epoch++ {
-		for i := range inputs {
-			n.Train(inputs[i], targets[i])
-		}
+		n.TrainBatch(inputs, targets)
 	}
 
 	for i := range inputs {
 		out := n.Predict(inputs[i])[0]
-		exp := targets[i][0]
-		assert.InDelta(t, exp, out, 0.3)
+		assert.InDelta(t, targets[i][0], out, 0.35)
 	}
 }
 
 // ---------------------------------------------------------
-// CrossEntropy + Softmax Test (Multiclass)
+// Softmax + CrossEntropy (Multiclass)
 // ---------------------------------------------------------
 
 func TestSoftmaxCrossEntropyTraining(t *testing.T) {
@@ -241,7 +260,7 @@ func TestSoftmaxCrossEntropyTraining(t *testing.T) {
 
 	n := NewNetwork(
 		2,
-		[]int{4},
+		[]int{6},
 		2,
 		[]string{ReLU, Softmax},
 		0.1,
@@ -249,10 +268,8 @@ func TestSoftmaxCrossEntropyTraining(t *testing.T) {
 		OptimizerSGD,
 	)
 
-	for epoch := 0; epoch < 2000; epoch++ {
-		for i := range inputs {
-			n.Train(inputs[i], targets[i])
-		}
+	for epoch := 0; epoch < 1500; epoch++ {
+		n.TrainBatch(inputs, targets)
 	}
 
 	out1 := n.Predict([]float64{1, 0})

@@ -33,6 +33,12 @@ net := neuralnet.NewNetwork(
 output := net.Predict(inputVector)
 ```
 
+### Test
+
+```shell
+go test -coverprofile=coverage.out -v -race ./...
+```
+
 ## License
 
 MIT © mg52

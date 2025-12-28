@@ -6,6 +6,8 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime"
+	"sync"
 )
 
 // ------------------------------------------------------------
@@ -188,6 +190,11 @@ func NewNetwork(
 // ------------------------------------------------------------
 
 func (n *Network) Predict(input []float64) []float64 {
+	// Defensive check (avoids mysterious panics)
+	if len(input) != n.InputSize {
+		panic(fmt.Sprintf("Predict: input length %d != InputSize %d", len(input), n.InputSize))
+	}
+
 	a := input
 	for i := 0; i < len(n.Weights); i++ {
 		z := computeLayerInput(a, n.Weights[i], n.Biases[i])
@@ -200,92 +207,157 @@ func (n *Network) Predict(input []float64) []float64 {
 	return a
 }
 
+// PredictBatch runs inference in parallel (good for test/eval ranking, etc.)
+func (n *Network) PredictBatch(inputs [][]float64) [][]float64 {
+	out := make([][]float64, len(inputs))
+	if len(inputs) == 0 {
+		return out
+	}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+
+	jobs := make(chan int, workers*2)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				out[idx] = n.Predict(inputs[idx])
+			}
+		}()
+	}
+
+	for i := range inputs {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	return out
+}
+
+// Optional: sequential batch predict (sometimes useful for profiling)
+func (n *Network) PredictBatchSequential(inputs [][]float64) [][]float64 {
+	out := make([][]float64, len(inputs))
+	for i := range inputs {
+		out[i] = n.Predict(inputs[i])
+	}
+	return out
+}
+
 // ------------------------------------------------------------
 // Training
 // ------------------------------------------------------------
 
+// TrainBatch now computes gradients in parallel, then applies ONE serial weight update.
+// This is the safest/standard approach: parallel compute, serial apply.
 func (n *Network) TrainBatch(inputs, targets [][]float64) float64 {
+	if len(inputs) != len(targets) {
+		panic(fmt.Sprintf("TrainBatch: inputs len %d != targets len %d", len(inputs), len(targets)))
+	}
+	if len(inputs) == 0 {
+		return 0
+	}
+
+	// Validate shapes early (prevents index-out-of-range deep in backprop)
+	for i := range inputs {
+		if len(inputs[i]) != n.InputSize {
+			panic(fmt.Sprintf("TrainBatch: input[%d] length %d != InputSize %d", i, len(inputs[i]), n.InputSize))
+		}
+		if len(targets[i]) != n.OutputSize {
+			panic(fmt.Sprintf("TrainBatch: target[%d] length %d != OutputSize %d", i, len(targets[i]), n.OutputSize))
+		}
+	}
+
 	numLayers := len(n.Weights)
 	batchSize := float64(len(inputs))
 
-	dW := make([][][]float64, numLayers)
-	dB := make([][]float64, numLayers)
-	for l := 0; l < numLayers; l++ {
-		dW[l] = zeroMatrix(len(n.Weights[l]), len(n.Weights[l][0]))
-		dB[l] = make([]float64, len(n.Biases[l]))
+	// Adam step counter should advance ONCE per parameter update step.
+	if n.Optimizer == OptimizerAdam {
+		n.T++
 	}
 
+	// Worker pool
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(inputs) {
+		workers = len(inputs)
+	}
+
+	type workerGrad struct {
+		dW   [][][]float64
+		dB   [][]float64
+		loss float64
+	}
+
+	// Each worker builds its own local gradient buffers to avoid locks.
+	makeZeroGrads := func() ([][][]float64, [][]float64) {
+		dW := make([][][]float64, numLayers)
+		dB := make([][]float64, numLayers)
+		for l := 0; l < numLayers; l++ {
+			dW[l] = zeroMatrix(len(n.Weights[l]), len(n.Weights[l][0]))
+			dB[l] = make([]float64, len(n.Biases[l]))
+		}
+		return dW, dB
+	}
+
+	jobs := make(chan int, workers*2)
+	results := make(chan workerGrad, workers)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+
+			localDW, localDB := makeZeroGrads()
+			localLoss := 0.0
+
+			for idx := range jobs {
+				dw, db, loss := n.gradientsForSample(inputs[idx], targets[idx])
+				localLoss += loss
+				accumulateDW(localDW, dw)
+				accumulateDB(localDB, db)
+			}
+
+			results <- workerGrad{dW: localDW, dB: localDB, loss: localLoss}
+		}()
+	}
+
+	for i := range inputs {
+		jobs <- i
+	}
+	close(jobs)
+
+	wg.Wait()
+	close(results)
+
+	// Reduce worker gradients
+	dW, dB := makeZeroGrads()
 	totalLoss := 0.0
 
-	for b := range inputs {
-		input := inputs[b]
-		target := targets[b]
-
-		// Forward pass
-		layerInputs := make([][]float64, numLayers)
-		layerActivations := make([][]float64, numLayers+1)
-		layerActivations[0] = input
-
-		for i := 0; i < numLayers; i++ {
-			z := computeLayerInput(layerActivations[i], n.Weights[i], n.Biases[i])
-			layerInputs[i] = z
-
-			if n.IsSoftmaxOut && i == numLayers-1 {
-				layerActivations[i+1] = softmax(z)
-			} else {
-				layerActivations[i+1] = applyActivation(z, n.Activations[i])
-			}
-		}
-
-		output := layerActivations[numLayers]
-		totalLoss += n.LossFunc(output, target)
-		errors := n.LossDerivative(output, target)
-
-		// Backprop
-		deltas := make([][]float64, numLayers)
-		deltas[numLayers-1] = make([]float64, len(errors))
-
-		for i := range errors {
-			if n.IsSoftmaxOut && n.LossName == LossCrossEntropy {
-				deltas[numLayers-1][i] = errors[i]
-			} else {
-				deltas[numLayers-1][i] = errors[i] * n.ActivationPrimes[numLayers-1](layerInputs[numLayers-1][i])
-			}
-		}
-
-		for l := numLayers - 2; l >= 0; l-- {
-			deltas[l] = make([]float64, len(n.Biases[l]))
-			for i := range deltas[l] {
-				sum := 0.0
-				for j := 0; j < len(deltas[l+1]); j++ {
-					sum += deltas[l+1][j] * n.Weights[l+1][j][i]
-				}
-				deltas[l][i] = sum * n.ActivationPrimes[l](layerInputs[l][i])
-			}
-		}
-
-		// Accumulate gradients
-		for l := 0; l < numLayers; l++ {
-			for i := 0; i < len(dW[l]); i++ {
-				for j := 0; j < len(dW[l][i]); j++ {
-					dW[l][i][j] += deltas[l][i] * layerActivations[l][j]
-				}
-				dB[l][i] += deltas[l][i]
-			}
-		}
+	for r := range results {
+		totalLoss += r.loss
+		accumulateDW(dW, r.dW)
+		accumulateDB(dB, r.dB)
 	}
 
-	// Update parameters
+	// Apply update (serial)
 	for l := 0; l < numLayers; l++ {
 		for i := 0; i < len(dW[l]); i++ {
 			for j := 0; j < len(dW[l][i]); j++ {
-
 				gradW := dW[l][i][j] / batchSize
 
-				// Adam
 				if n.Optimizer == OptimizerAdam {
-					n.T++
-
+					// Adam weight update
 					n.MW[l][i][j] = n.Beta1*n.MW[l][i][j] + (1-n.Beta1)*gradW
 					n.VW[l][i][j] = n.Beta2*n.VW[l][i][j] + (1-n.Beta2)*(gradW*gradW)
 
@@ -293,7 +365,6 @@ func (n *Network) TrainBatch(inputs, targets [][]float64) float64 {
 					vHat := n.VW[l][i][j] / (1 - math.Pow(n.Beta2, float64(n.T)))
 
 					n.Weights[l][i][j] -= n.LearningRate * mHat / (math.Sqrt(vHat) + n.Epsilon)
-
 				} else {
 					// SGD
 					n.Weights[l][i][j] -= n.LearningRate * gradW
@@ -301,7 +372,6 @@ func (n *Network) TrainBatch(inputs, targets [][]float64) float64 {
 			}
 
 			gradB := dB[l][i] / batchSize
-
 			if n.Optimizer == OptimizerAdam {
 				n.M[l][i] = n.Beta1*n.M[l][i] + (1-n.Beta1)*gradB
 				n.V[l][i] = n.Beta2*n.V[l][i] + (1-n.Beta2)*(gradB*gradB)
@@ -319,8 +389,95 @@ func (n *Network) TrainBatch(inputs, targets [][]float64) float64 {
 	return totalLoss / batchSize
 }
 
+// Train keeps your existing API
 func (n *Network) Train(input, target []float64) float64 {
 	return n.TrainBatch([][]float64{input}, [][]float64{target})
+}
+
+// gradientsForSample computes per-sample gradients dW/dB and loss (read-only on weights/biases)
+func (n *Network) gradientsForSample(input, target []float64) ([][][]float64, [][]float64, float64) {
+	numLayers := len(n.Weights)
+
+	// Forward pass caches
+	layerInputs := make([][]float64, numLayers)
+	layerActivations := make([][]float64, numLayers+1)
+	layerActivations[0] = input
+
+	for i := 0; i < numLayers; i++ {
+		z := computeLayerInput(layerActivations[i], n.Weights[i], n.Biases[i])
+		layerInputs[i] = z
+
+		if n.IsSoftmaxOut && i == numLayers-1 {
+			layerActivations[i+1] = softmax(z)
+		} else {
+			layerActivations[i+1] = applyActivation(z, n.Activations[i])
+		}
+	}
+
+	output := layerActivations[numLayers]
+	loss := n.LossFunc(output, target)
+	errors := n.LossDerivative(output, target)
+
+	// Backprop
+	deltas := make([][]float64, numLayers)
+	deltas[numLayers-1] = make([]float64, len(errors))
+
+	for i := range errors {
+		if n.IsSoftmaxOut && n.LossName == LossCrossEntropy {
+			deltas[numLayers-1][i] = errors[i]
+		} else {
+			deltas[numLayers-1][i] = errors[i] * n.ActivationPrimes[numLayers-1](layerInputs[numLayers-1][i])
+		}
+	}
+
+	for l := numLayers - 2; l >= 0; l-- {
+		deltas[l] = make([]float64, len(n.Biases[l]))
+		for i := range deltas[l] {
+			sum := 0.0
+			for j := 0; j < len(deltas[l+1]); j++ {
+				sum += deltas[l+1][j] * n.Weights[l+1][j][i]
+			}
+			deltas[l][i] = sum * n.ActivationPrimes[l](layerInputs[l][i])
+		}
+	}
+
+	// Allocate sample gradients
+	dW := make([][][]float64, numLayers)
+	dB := make([][]float64, numLayers)
+	for l := 0; l < numLayers; l++ {
+		dW[l] = zeroMatrix(len(n.Weights[l]), len(n.Weights[l][0]))
+		dB[l] = make([]float64, len(n.Biases[l]))
+	}
+
+	// Compute gradients
+	for l := 0; l < numLayers; l++ {
+		for i := 0; i < len(dW[l]); i++ {
+			for j := 0; j < len(dW[l][i]); j++ {
+				dW[l][i][j] = deltas[l][i] * layerActivations[l][j]
+			}
+			dB[l][i] = deltas[l][i]
+		}
+	}
+
+	return dW, dB, loss
+}
+
+func accumulateDW(dst, src [][][]float64) {
+	for l := range dst {
+		for i := range dst[l] {
+			for j := range dst[l][i] {
+				dst[l][i][j] += src[l][i][j]
+			}
+		}
+	}
+}
+
+func accumulateDB(dst, src [][]float64) {
+	for l := range dst {
+		for i := range dst[l] {
+			dst[l][i] += src[l][i]
+		}
+	}
 }
 
 // ------------------------------------------------------------
